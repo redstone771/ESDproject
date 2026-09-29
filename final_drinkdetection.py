@@ -1,134 +1,146 @@
-import torch
-import numpy as np
-import mediapipe as mp
+"""Raspberry Pi: Picamera2 + GPIO buzzer, optional email and preview."""
+import argparse
 import os
-import sys
-import time
-import cv2
-import RPi.GPIO as GPIO
-from picamera2 import Picamera2
 import smtplib
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
+from drink_detector import DrinkDetector, add_detector_arguments, validate_arguments, draw_frame
 
-email=input(print('이메일을 입력해주세요(n 입력시 기본이메일) >'))
-if '@' in email:
-    email=email
-else: email='embeddedsystemdesign@naver.com'
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-YOLOV5_PATH = os.path.join(ROOT)
-sys.path.append(YOLOV5_PATH)
+class Buzzer:
+    """A timer stops each pulse without blocking camera processing."""
+    def __init__(self, gpio, pin):
+        self.gpio, self.pin = gpio, pin
+        self.lock = threading.Lock()
+        self.timer = None
+        self.active = False
+        self.closed = False
+        gpio.setmode(gpio.BCM)
+        gpio.setup(pin, gpio.OUT, initial=gpio.LOW)
+        self.pwm = gpio.PWM(pin, 1000)
+        self.pwm.start(0)
 
-from models.common import DetectMultiBackend
-from utils.general import non_max_suppression
-from utils.torch_utils import select_device
+    def trigger(self):
+        with self.lock:
+            if self.active or self.closed:
+                return
+            self.pwm.ChangeDutyCycle(50)
+            self.active = True
+            self.timer = threading.Timer(0.5, self._stop_pulse)
+            self.timer.daemon = True
+            self.timer.start()
 
-device = select_device('cpu')
-drink_model = DetectMultiBackend(os.path.join(YOLOV5_PATH, 'best (1).pt'), device=device)
-drink_model.eval()
-drink_names = drink_model.names
+    def _stop_pulse(self):
+        with self.lock:
+            if not self.closed:
+                self.pwm.ChangeDutyCycle(0)
+                self.active = False
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5)
+    def close(self):
+        with self.lock:
+            self.closed = True
+            if self.timer:
+                self.timer.cancel()
+            self.pwm.stop()
+            self.gpio.cleanup(self.pin)
 
-picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)}))
-picam2.start()
 
-BUZZER_PIN = 4
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(BUZZER_PIN, GPIO.OUT)
-pwm = GPIO.PWM(BUZZER_PIN, 1000)
+class EmailNotifier:
+    """Opt-in SMTP alerts, at most one attempt per 60 seconds."""
+    def __init__(self, recipient):
+        self.recipient = recipient
+        self.user = os.environ.get('SMTP_USER')
+        self.password = os.environ.get('SMTP_PASSWORD')
+        if not self.user or not self.password:
+            raise ValueError('--email requires SMTP_USER and SMTP_PASSWORD environment variables')
+        self.host = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+        self.port = int(os.environ.get('SMTP_PORT', '587'))
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.future = None
+        self.last_attempt = float('-inf')
 
-prev_time = 0
-last_email_time = 0
-EMAIL_INTERVAL = 60  # 초 단위, 이메일 전송 간 최소 간격
+    def notify(self):
+        now = time.monotonic()
+        if now - self.last_attempt < 60 or (self.future is not None and not self.future.done()):
+            return
+        self.last_attempt = now
+        self.future = self.executor.submit(self._send)
 
-def send_email():
+    def _send(self):
+        message = MIMEText('A bottle, can or cup was detected near a hand.')
+        message['Subject'] = 'Drink detection alert'
+        message['From'], message['To'] = self.user, self.recipient
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=10) as smtp:
+                smtp.starttls()
+                smtp.login(self.user, self.password)
+                smtp.sendmail(self.user, [self.recipient], message.as_string())
+            print('Email alert sent')
+        except Exception as exc:
+            print(f'Email alert failed ({type(exc).__name__}); camera detection continues.')
+
+    def close(self):
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Raspberry Pi drink detection and buzzer')
+    add_detector_arguments(parser)
+    parser.add_argument('--buzzer-pin', type=int, default=4, help='BCM GPIO number (default 4)')
+    parser.add_argument('--preview', action='store_true', help='Show OpenCV window; Q exits')
+    parser.add_argument('--email', help='Optional alert recipient; SMTP credentials come from environment')
+    args = parser.parse_args()
+    validate_arguments(args, parser)
+    if not 0 <= args.buzzer_pin <= 27:
+        parser.error('--buzzer-pin must be a BCM GPIO number between 0 and 27')
+    from picamera2 import Picamera2
+    import RPi.GPIO as GPIO
+    detector = camera = buzzer = notifier = None
+    camera_started = False
     try:
-        smtp = smtplib.SMTP('smtp.gmail.com', 587)
-        smtp.starttls()
-        smtp.login('embeddedsystemdesign12@gmail.com', 'vfnfiybfutnwsbba') 
-        msg = MIMEText('room no.10')
-        msg['Subject'] = '경고: drinks detected (room no.10)'
-        msg['From'] = 'embeddedsystemdesign12@gmail.com'
-        msg['To'] = email
-        smtp.sendmail('embeddedsystemdesign12@gmail.com', email, msg.as_string())
-        smtp.quit()
-        print("email sent.")
-    except Exception as e:
-        print(f"Failed to send email: {e}")
+        if args.email:
+            notifier = EmailNotifier(args.email)
+        detector = DrinkDetector(args)
+        camera = Picamera2()
+        # Picamera2 RGB888 capture_array uses byte order B,G,R, matching OpenCV.
+        camera.configure(camera.create_preview_configuration(main={'format': 'RGB888', 'size': (640, 480)}))
+        camera.start()
+        camera_started = True
+        buzzer = Buzzer(GPIO, args.buzzer_pin)
+        while True:
+            started = time.perf_counter()
+            frame = camera.capture_array('main')
+            regions, detections = detector.detect(frame)
+            if detections:
+                buzzer.trigger()
+                if notifier:
+                    notifier.notify()
+            fps = 1 / max(time.perf_counter() - started, 1e-6)
+            print(f'FPS: {fps:.2f} | drink: {bool(detections)}', flush=True)
+            if args.preview:
+                import cv2
+                cv2.imshow('Drink Detection - Raspberry Pi', draw_frame(frame, regions, detections, fps))
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if buzzer:
+            buzzer.close()
+        if camera:
+            if camera_started:
+                camera.stop()
+            camera.close()
+        if detector:
+            detector.close()
+        if notifier:
+            notifier.close()
+        if args.preview:
+            import cv2
+            cv2.destroyAllWindows()
 
-def preprocess(img):
-    img_resized = cv2.resize(img, (320, 320))
-    img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
-    return img_tensor.unsqueeze(0).to(device)
 
-frame_count = 0
-
-try:
-    while True:
-        frame = picam2.capture_array()
-
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized_img = cv2.resize(img_rgb, (320, 240))
-        scale_x = frame.shape[1] / 320
-        scale_y = frame.shape[0] / 240
-
-        roi_regions = []
-
-        if frame_count % 2 == 0:
-            hand_results = hands.process(resized_img)
-            if hand_results.multi_hand_landmarks:
-                for hand_landmarks in hand_results.multi_hand_landmarks:
-                    x_list = [lm.x * 320 for lm in hand_landmarks.landmark]
-                    y_list = [lm.y * 240 for lm in hand_landmarks.landmark]
-                    cx = int(np.mean(x_list) * scale_x)
-                    cy = int(np.mean(y_list) * scale_y)
-                    size = 150
-                    x1, y1 = max(cx - size, 0), max(cy - size, 0)
-                    x2, y2 = min(cx + size, frame.shape[1]), min(cy + size, frame.shape[0])
-                    roi_regions.append((x1, y1, x2, y2))
-
-        drink_detected = False
-        for (x1, y1, x2, y2) in roi_regions:
-            roi = frame[y1:y2, x1:x2]
-            if roi.size == 0:
-                continue
-            input_tensor = preprocess(roi)
-            with torch.no_grad():
-                pred = drink_model(input_tensor)
-                pred = non_max_suppression(pred, conf_thres=0.7, iou_thres=0.8)[0]
-
-            scale_roi_x = (x2 - x1) / 320
-            scale_roi_y = (y2 - y1) / 320
-
-            if pred is not None:
-                for *box, conf, cls in pred:
-                    label = drink_names[int(cls)].lower()
-                    if label == "drinks":
-                        drink_detected = True
-                        break
-
-        if drink_detected:
-            pwm.start(50)
-            pwm.ChangeFrequency(1000)
-            time.sleep(0.5)
-            pwm.stop()
-
-            curr_email_time = time.time()
-            if curr_email_time - last_email_time > EMAIL_INTERVAL:
-                send_email()
-                last_email_time = curr_email_time
-
-        curr_time = time.time()
-        fps = 1 / (curr_time - prev_time) if prev_time else 0
-        prev_time = curr_time
-        print(f'FPS: {fps:.2f}')
-
-        frame_count += 1
-
-finally:
-    picam2.stop()
-    pwm.stop()
-    GPIO.cleanup()
+if __name__ == '__main__':
+    main()
